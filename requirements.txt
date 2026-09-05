@@ -36,7 +36,7 @@ torch==2.14.0
 # 2.6.1 has an unsafe-deserialization RCE (GHSA-cq46-m9x9-j8w2), fixed in 2.7.0.
 scapy==2.7.0
 
-fastapi==0.135.0
+fastapi==0.141.1
 # Transitive via fastapi, unpinned; resolved to 0.52.1, which carries an
 # SSRF/NTLM-credential-theft CVE and a request.form() DoS CVE (confirmed
 # by Trivy against the built image). Pin explicitly to a fixed version.
