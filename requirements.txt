@@ -60,7 +60,7 @@ idna==3.19
 # 0.11.3 caps click<8.2, which blocks the CVE-fixed click version below;
 # bumped to the version confirmed (via pip's resolver) to allow it.
 faust-streaming==0.15.3
-psutil==6.0.0
+psutil==7.2.2
 python-dateutil==2.9.0.post0
 # Replaced python-jose: it unconditionally requires rsa+ecdsa+pyasn1
 # regardless of which extra is selected (even [cryptography], which our
