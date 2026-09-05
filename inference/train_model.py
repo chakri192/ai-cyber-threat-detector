@@ -81,6 +81,23 @@ def generate_hard_dataset(num_samples=100000):
 
     return torch.tensor(encoded_data, dtype=torch.long), torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
 
+
+def save_traced_model(traced_model, save_path):
+    """Persist a traced model and its sidecar .sha256 together.
+
+    Without the sidecar, the next DeepLearningEngine startup's (correctly
+    fail-safe) integrity check finds a stale/missing .sha256, fails closed,
+    and crash-loops the fleet. scripts/train_dl_models.py already does this
+    correctly -- pulled out as its own function here so it's testable
+    without running a full training loop.
+    """
+    traced_model.save(save_path)
+    with open(save_path, "rb") as f:
+        file_hash = hashlib.sha256(f.read()).hexdigest()
+    with open(save_path + ".sha256", "w") as f:
+        f.write(file_hash + "\n")
+    return file_hash
+
 def train_to_max():
     print("[*] Generating Hardened Training Dataset (100,000 domains)...")
     print("[*] Incorporating Dictionary DGAs and Homoglyph Attacks...")
@@ -128,16 +145,7 @@ def train_to_max():
 
             traced_model = torch.jit.trace(model, torch.zeros((1, 35), dtype=torch.long))
             save_path = "models/cnn_dga.pt"
-            traced_model.save(save_path)
-
-            # Without this, the next DeepLearningEngine startup's (correctly
-            # fail-safe) integrity check finds a stale/missing .sha256,
-            # fails closed, and crash-loops the fleet. scripts/train_dl_models.py
-            # already does this correctly -- mirror it here.
-            with open(save_path, "rb") as f:
-                file_hash = hashlib.sha256(f.read()).hexdigest()
-            with open(save_path + ".sha256", "w") as f:
-                f.write(file_hash + "\n")
+            save_traced_model(traced_model, save_path)
         else:
             print(f"    Epoch {epoch:02d} | Val Accuracy: {acc_val:.3f}% (No improvement)")
             epochs_no_improve += 1

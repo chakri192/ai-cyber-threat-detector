@@ -100,6 +100,65 @@ def send_to_dlq(dlq_producer, item, error_msg, timeout=2.0):
     except Exception as e:
         logger.error("Failed to send to Kafka DLQ topic: %s", e)
 
+
+def _safe_dlq_send(dlq_producer, alert_id, raw_item, error_msg):
+    """Best-effort DLQ with local file fallback; never blocks caller."""
+    try:
+        send_to_dlq(dlq_producer, raw_item, error_msg, timeout=2.0)
+    except Exception as e:
+        logger.error("DLQ send failed for %s: %s", alert_id, e)
+    write_to_file_dlq(raw_item, error_msg)
+
+
+def process_batch(current_batch, dlq_producer=None, session_factory=SessionLocal):
+    """Processes an entire batch within a single DB session using savepoints for item isolation.
+
+    Module-level (not a run_sink() closure) so the validate-before-ORM path --
+    the fix that stops an attacker-influenced Kafka payload from ever setting
+    the primary key or a SQLAlchemy internal attribute name -- is directly
+    unit-testable against a real (sqlite) session instead of only reachable
+    through a live Kafka consumer loop.
+    """
+    offsets_map = {}
+    db = session_factory(expire_on_commit=False)
+    try:
+        for raw_item, tp, offset in current_batch:
+            try:
+                if isinstance(raw_item.get("evidence"), (dict, list)):
+                    raw_item = {**raw_item, "evidence": json.dumps(raw_item["evidence"])}
+                # Validate against the whitelisted schema BEFORE touching the ORM.
+                # This is what stops an attacker-influenced Kafka payload from ever
+                # setting the primary key or a SQLAlchemy internal attribute name —
+                # AlertPayload has no "id" field and no "metadata"/"registry" field,
+                # so neither can reach Alert(**alert_dict) no matter what raw_item contains.
+                alert_dict = AlertPayload(**raw_item).model_dump()
+                aid = alert_dict["alert_id"]
+                with db.begin_nested():
+                    existing = db.query(Alert).filter(Alert.alert_id == aid).first()
+                    if existing:
+                        for k, v in alert_dict.items():
+                            setattr(existing, k, v)
+                    else:
+                        alert_obj = Alert(**alert_dict)
+                        db.add(alert_obj)
+                    db.flush()
+                offsets_map[tp] = max(offsets_map.get(tp, -1), offset + 1)
+            except Exception as item_err:
+                # Item-level data formatting/integrity issue: isolate to DLQ and advance offset
+                logger.error("Item processing failed for alert %s: %s", raw_item.get('alert_id'), item_err)
+                _safe_dlq_send(dlq_producer, raw_item.get('alert_id', ''), raw_item, str(item_err))
+                offsets_map[tp] = max(offsets_map.get(tp, -1), offset + 1)
+        db.commit()
+        return offsets_map
+    except Exception as batch_err:
+        # DB connection/commit error: rollback and DO NOT advance offsets so batch is safely retried
+        db.rollback()
+        logger.error("Batch DB commit failure (will retry on next cycle): %s", batch_err)
+        return {}
+    finally:
+        db.close()
+
+
 def run_sink():
     broker_list = [b.strip() for b in brokers.split(',') if b.strip()]
     consumer = KafkaConsumer(
@@ -116,59 +175,6 @@ def run_sink():
     MAX_COMMIT_RETRIES = 3
     batch = []
     last_commit = time.time()
-
-    def _atomic_dlq_write(item, error_msg):
-        """Append-only thread-safe DLQ write with flock + fsync."""
-        write_to_file_dlq(item, error_msg)
-
-    def _safe_dlq_send(alert_id, raw_item, error_msg):
-        """Best-effort DLQ with local file fallback; never blocks caller."""
-        try:
-            send_to_dlq(dlq_producer, raw_item, error_msg, timeout=2.0)
-        except Exception as e:
-            logger.error("DLQ send failed for %s: %s", alert_id, e)
-        _atomic_dlq_write(raw_item, error_msg)
-
-    def process_batch(current_batch):
-        """Processes an entire batch within a single DB session using savepoints for item isolation."""
-        offsets_map = {}
-        db = SessionLocal(expire_on_commit=False)
-        try:
-            for raw_item, tp, offset in current_batch:
-                try:
-                    if isinstance(raw_item.get("evidence"), (dict, list)):
-                        raw_item = {**raw_item, "evidence": json.dumps(raw_item["evidence"])}
-                    # Validate against the whitelisted schema BEFORE touching the ORM.
-                    # This is what stops an attacker-influenced Kafka payload from ever
-                    # setting the primary key or a SQLAlchemy internal attribute name —
-                    # AlertPayload has no "id" field and no "metadata"/"registry" field,
-                    # so neither can reach Alert(**alert_dict) no matter what raw_item contains.
-                    alert_dict = AlertPayload(**raw_item).model_dump()
-                    aid = alert_dict["alert_id"]
-                    with db.begin_nested():
-                        existing = db.query(Alert).filter(Alert.alert_id == aid).first()
-                        if existing:
-                            for k, v in alert_dict.items():
-                                setattr(existing, k, v)
-                        else:
-                            alert_obj = Alert(**alert_dict)
-                            db.add(alert_obj)
-                        db.flush()
-                    offsets_map[tp] = max(offsets_map.get(tp, -1), offset + 1)
-                except Exception as item_err:
-                    # Item-level data formatting/integrity issue: isolate to DLQ and advance offset
-                    logger.error("Item processing failed for alert %s: %s", raw_item.get('alert_id'), item_err)
-                    _safe_dlq_send(raw_item.get('alert_id', ''), raw_item, str(item_err))
-                    offsets_map[tp] = max(offsets_map.get(tp, -1), offset + 1)
-            db.commit()
-            return offsets_map
-        except Exception as batch_err:
-            # DB connection/commit error: rollback and DO NOT advance offsets so batch is safely retried
-            db.rollback()
-            logger.error("Batch DB commit failure (will retry on next cycle): %s", batch_err)
-            return {}
-        finally:
-            db.close()
 
     consecutive_commit_failures = 0
     MAX_CONSECUTIVE_FAILURES = 5
@@ -229,7 +235,7 @@ def run_sink():
 
         # Commit on size or time
         if (len(batch) >= MAX_BATCH_SIZE) or (len(batch) > 0 and time.time() - last_commit >= 5):
-            processed_offsets = process_batch(batch)
+            processed_offsets = process_batch(batch, dlq_producer=dlq_producer)
 
             if processed_offsets:
                 commit_success = False
@@ -260,7 +266,7 @@ def run_sink():
                         logger.critical("Persistent Kafka commit failure threshold reached. Evacuating %d alerts to file DLQ.", len(batch))
                         max_offsets = {}
                         for raw_item, tp, offset in batch:
-                            _atomic_dlq_write(raw_item, "KafkaCommitFailureThresholdExceeded")
+                            write_to_file_dlq(raw_item, "KafkaCommitFailureThresholdExceeded")
                             max_offsets[tp] = max(max_offsets.get(tp, -1), offset + 1)
                         if max_offsets:
                             try:
@@ -280,7 +286,7 @@ def run_sink():
                     logger.critical("Persistent Database commit failure threshold reached. Evacuating %d alerts.", len(batch))
                     max_offsets = {}
                     for raw_item, tp, offset in batch:
-                        _atomic_dlq_write(raw_item, "DatabaseCommitFailureThresholdExceeded")
+                        write_to_file_dlq(raw_item, "DatabaseCommitFailureThresholdExceeded")
                         max_offsets[tp] = max(max_offsets.get(tp, -1), offset + 1)
                     if max_offsets:
                         try:
@@ -324,7 +330,7 @@ def run_sink():
             logger.critical("PANIC: Batch exceeded hard guard (%d); evacuating to DLQ immediately.", len(batch))
             max_offsets = {}
             for raw_item, tp, offset in batch:
-                _atomic_dlq_write(raw_item, "BatchPanicThresholdExceeded")
+                write_to_file_dlq(raw_item, "BatchPanicThresholdExceeded")
                 max_offsets[tp] = max(max_offsets.get(tp, -1), offset + 1)
             if max_offsets:
                 try:
@@ -341,7 +347,7 @@ def run_sink():
 
     logger.info("Graceful shutdown: loop exited. Processing any remaining %d items in batch...", len(batch))
     if len(batch) > 0:
-        processed_offsets = process_batch(batch)
+        processed_offsets = process_batch(batch, dlq_producer=dlq_producer)
         if processed_offsets:
             try:
                 offsets_to_commit = {tp: OffsetAndMetadata(off, '') for tp, off in processed_offsets.items()}

@@ -814,6 +814,147 @@ class TestSOCPipelineSecurity(unittest.TestCase):
         self.assertIsNotNone(dlq_vct)
         self.assertIn("ReadWriteOnce", dlq_vct.get("spec", {}).get("accessModes", []))
 
+    # ----------------------------------------------------------------
+    # stream_processor_faust.py coverage was concentrated in the single
+    # constant-wiring test above; these exercise the DLQ fallback and
+    # shutdown paths directly instead of only inspecting source text.
+    # ----------------------------------------------------------------
+
+    def test_lazy_semaphore_acquire_and_release(self):
+        from inference.stream_processor_faust import backpressure_sem
+
+        async def _use_it():
+            async with backpressure_sem:
+                return "acquired"
+
+        self.assertEqual(asyncio.run(_use_it()), "acquired")
+
+    def test_send_dlq_safely_falls_back_to_local_disk_when_kafka_send_fails(self):
+        import tempfile
+        from inference.stream_processor_faust import _send_dlq_safely
+        import inference.stream_processor_faust as sp
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            test_dlq_path = os.path.join(temp_dir, "dlq.jsonl")
+            orig_dlq_path, orig_lock_path = sp.DLQ_FILE_PATH, sp.DLQ_LOCK_PATH
+            try:
+                sp.DLQ_FILE_PATH = test_dlq_path
+                sp.DLQ_LOCK_PATH = f"{test_dlq_path}.lock"
+
+                # dead_letter_topic.send() will itself fail here (no live
+                # Faust app/broker in the test process), which is exactly
+                # the condition this function exists to survive -- it
+                # should fall through to the local-disk fallback below.
+                asyncio.run(_send_dlq_safely(
+                    {"raw": "event"}, {"alert_id": "ALT-1"}, "boom"
+                ))
+
+                self.assertTrue(os.path.exists(test_dlq_path))
+                with open(test_dlq_path) as f:
+                    import json as _json
+                    line = _json.loads(f.readline())
+                self.assertEqual(line["error"], "boom")
+                # is_replay=True is stamped onto DLQ'd alerts so a later
+                # replay pass can distinguish them from first-pass alerts.
+                self.assertTrue(line["alert"]["is_replay"])
+            finally:
+                sp.DLQ_FILE_PATH = orig_dlq_path
+                sp.DLQ_LOCK_PATH = orig_lock_path
+
+    def test_write_local_dlq_fallback_never_raises_on_os_error(self):
+        from inference.stream_processor_faust import _write_local_dlq_fallback
+        import inference.stream_processor_faust as sp
+
+        orig_dlq_path = sp.DLQ_FILE_PATH
+        try:
+            # A path under a location this process cannot create must hit
+            # the function's own except-and-log branch, not propagate.
+            sp.DLQ_FILE_PATH = "/nonexistent-root-only-dir/dlq.jsonl"
+            _write_local_dlq_fallback({"alert_id": "x"})  # must not raise
+        finally:
+            sp.DLQ_FILE_PATH = orig_dlq_path
+
+    def test_graceful_shutdown_cancels_futures_and_exits(self):
+        import inference.stream_processor_faust as sp
+        from concurrent.futures import ThreadPoolExecutor
+
+        throwaway_cpu = ThreadPoolExecutor(max_workers=1)
+        throwaway_io = ThreadPoolExecutor(max_workers=1)
+        fake_cpu_future = MagicMock()
+        fake_io_future = MagicMock()
+
+        orig_cpu, orig_io = sp.cpu_executor, sp.io_executor
+        sp._submitted_cpu_futures.add(fake_cpu_future)
+        sp._submitted_io_futures.add(fake_io_future)
+        try:
+            sp.cpu_executor, sp.io_executor = throwaway_cpu, throwaway_io
+            with self.assertRaises(SystemExit):
+                sp._graceful_shutdown(15, None)
+            fake_cpu_future.cancel.assert_called_once()
+            fake_io_future.cancel.assert_called_once()
+        finally:
+            sp.cpu_executor, sp.io_executor = orig_cpu, orig_io
+            sp._submitted_cpu_futures.discard(fake_cpu_future)
+            sp._submitted_io_futures.discard(fake_io_future)
+
+    def test_shutdown_executors_actually_shuts_down_thread_pools(self):
+        import inference.stream_processor_faust as sp
+        from concurrent.futures import ThreadPoolExecutor
+
+        throwaway_cpu = ThreadPoolExecutor(max_workers=1)
+        throwaway_io = ThreadPoolExecutor(max_workers=1)
+        orig_cpu, orig_io = sp.cpu_executor, sp.io_executor
+        try:
+            sp.cpu_executor, sp.io_executor = throwaway_cpu, throwaway_io
+            sp._shutdown_executors()
+            with self.assertRaises(RuntimeError):
+                throwaway_cpu.submit(lambda: None)
+            with self.assertRaises(RuntimeError):
+                throwaway_io.submit(lambda: None)
+        finally:
+            sp.cpu_executor, sp.io_executor = orig_cpu, orig_io
+
+    def test_on_before_shutdown_completes_and_closes_enricher(self):
+        import inference.stream_processor_faust as sp
+
+        orig_shutdown = sp._shutdown_executors
+        try:
+            sp._shutdown_executors = lambda: None  # avoid killing the shared pools
+            asyncio.run(sp._on_before_shutdown())  # must not raise
+            self.assertTrue(sp.enricher.client.is_closed)
+        finally:
+            sp._shutdown_executors = orig_shutdown
+
+    def test_on_before_shutdown_survives_executor_shutdown_exception(self):
+        import inference.stream_processor_faust as sp
+
+        def _broken_shutdown():
+            raise RuntimeError("executor pool corrupted")
+
+        orig_shutdown = sp._shutdown_executors
+        try:
+            sp._shutdown_executors = _broken_shutdown
+            asyncio.run(sp._on_before_shutdown())  # must log, not raise
+        finally:
+            sp._shutdown_executors = orig_shutdown
+
+    def test_on_before_shutdown_survives_executor_shutdown_timeout(self):
+        import time as _time
+        import inference.stream_processor_faust as sp
+
+        def _slow_shutdown():
+            _time.sleep(0.3)
+
+        orig_shutdown = sp._shutdown_executors
+        orig_timeout = sp._EXECUTOR_SHUTDOWN_TIMEOUT
+        try:
+            sp._shutdown_executors = _slow_shutdown
+            sp._EXECUTOR_SHUTDOWN_TIMEOUT = 0.01
+            asyncio.run(sp._on_before_shutdown())  # must time out gracefully, not raise
+        finally:
+            sp._shutdown_executors = orig_shutdown
+            sp._EXECUTOR_SHUTDOWN_TIMEOUT = orig_timeout
+
 if __name__ == '__main__':
     unittest.main()
 # pytest.mark.skip added
