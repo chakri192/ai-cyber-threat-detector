@@ -1,143 +1,170 @@
-#  Data Diode Cyber Threat Defense Platform
+# TSOC — Data-Diode Threat Detection Platform
 
-> **Lightweight, Real-Time AI Cyber Threat Detection for Unidirectional IP Traffic (Hardware Data Diode / Passive Monitoring Enclave)**  
-> Built for Apple Silicon (ARM64) • Sub-Millisecond Multi-Model Inference • Interactive SOC Defense Dashboard
+Real-time network threat detection for unidirectional (data-diode / passive-tap) environments. It ingests Zeek-style connection and DNS metadata, classifies it with a mix of rule-based heuristics and PyTorch models, correlates related alerts into incidents, and exposes the result through an API, a web dashboard, and a terminal console.
 
----
+[![CI](https://github.com/chakri192/NeuralSOC/actions/workflows/ci.yml/badge.svg)](https://github.com/chakri192/NeuralSOC/actions/workflows/ci.yml)
 
-##  Architecture & Data Flow
+## Contents
+
+- [Architecture](#architecture)
+- [Detection coverage](#detection-coverage)
+- [Repository layout](#repository-layout)
+- [Requirements](#requirements)
+- [Configuration](#configuration)
+- [Running locally](#running-locally)
+- [Testing](#testing)
+- [Retraining the models](#retraining-the-models)
+- [Security](#security)
+- [Deployment](#deployment)
+
+## Architecture
+
+The platform never writes back to the monitored network — ingestion is read-only, matching a hardware data-diode's one-way link.
 
 ```
-   [ Unidirectional Link / Hardware Data Diode ]
-                        │ (Zero Reverse Path - Strictly Read-Only)
-                        ▼
-       ┌─────────────────────────────────┐
-       │     Live Zeek JSON Stream       │  (conn.log, dns.log, ssl.log)
-       └────────────────┬────────────────┘
-                        │
-                        ▼
-       ┌─────────────────────────────────┐
-       │   ingest/tail_to_redpanda.py    │  (Non-blocking Inode Tailer)
-       └────────────────┬────────────────┘
-                        │ Topic: raw_traffic
-                        ▼
-       ┌─────────────────────────────────┐
-       │  Redpanda Broker (ARM64 Docker) │  (512MB RAM, Low-Latency Broker)
-       └────────────────┬────────────────┘
-                        │
-                        ▼
-       ┌─────────────────────────────────┐
-       │ inference/stream_processor.py   │  (Multi-Model AI Inference Engine)
-       │  • DGA & Tunneling Classifier   │
-       │  • Flow Anomaly Isolation Forest│
-       │  • Multi-Class Threat Ensemble  │
-       │  • Stateful IAT Beacon Tracker  │
-       │  • Recon Fan-Out Sweep Tracker  │
-       │  • JA3/JA4 Malware Signature DB │
-       └────────────────┬────────────────┘
-                        │ Topic: security_alerts
-                        ▼
-       ┌─────────────────────────────────┐
-       │ dashboard/app.py (Streamlit)    │  (Live Telemetry, Topology Graph,
-       │                                 │   Incident Playbooks, Injector)
-       └─────────────────────────────────┘
+  Live Zeek JSON logs (conn.log, dns.log, ssl.log)
+                    │
+                    ▼
+   ingest/tail_to_redpanda.py   (tails logs, publishes to Kafka/Redpanda)
+                    │  topic: raw_traffic
+                    ▼
+       Redpanda / Kafka broker
+                    │
+                    ▼
+ inference/stream_processor_faust.py   (Faust stream processor)
+   • inference/rules.py        — rule-based heuristics (DDoS, beaconing,
+                                  recon, DGA fallback, JA4 fingerprinting)
+   • inference/models.py       — PyTorch DGA/homoglyph classifier
+   • inference/correlation.py  — Redis-backed alert-to-incident correlation
+   • inference/enrichment.py   — IP/ASN/geo enrichment
+                    │  topic: security_alerts / incidents
+                    ▼
+        api/kafka_sink.py   (validates + persists to Postgres)
+                    │
+                    ▼
+     api/main.py (FastAPI)  ──┬──  dashboard/app.py (Streamlit)
+                               └──  terminal/tsoc_console.py (Textual TUI)
 ```
 
----
+`ingest/simulator.py` generates synthetic Zeek-style traffic (including labeled attack scenarios) for local testing without a real data-diode feed.
 
-##  Key Features & Problem Statement Coverage
+## Detection coverage
 
-| Threat Category | Problem Statement Requirement | Detection Mechanism | MITRE ATT&CK ID |
-| :--- | :--- | :--- | :--- |
-| **a. Volumetric / Protocol DDoS** | SYN floods, UDP reflection/amplification | Uncompleted TCP `S0` state tracking & UDP amplification port heuristics | **T1498** |
-| **b. Botnet C2 Beaconing** | Periodicity & Inter-Arrival Time (IAT) analysis | Sliding window Mean IAT ($\mu$), standard deviation ($\sigma$), and Jitter ($CV < 0.15$) | **T1071** |
-| **c. DGA & DNS Tunnelling** | Shannon entropy, query length, record type anomalies | Shannon entropy ($H > 3.8$), Random Forest Classifier, Base64/Hex TXT parsing | **T1568.002** / **T1071.004** |
-| **d. Encrypted Malware Sessions** | Metadata-only TLS/QUIC without payload decryption | JA3/JA4 signature database (Cobalt Strike, Sliver, Metasploit), SNI entropy | **T1071.001** / **T1573.002** |
-| **e. Reconnaissance & Port Scans** | Fan-out patterns across destination ports or hosts | Stateful tracker identifying Vertical Port Scans and Horizontal Host Sweeps | **T1046** |
-| **f. Data Exfiltration** | Asymmetric flow volume and unusual outbound/inbound byte ratios | Outbound-to-inbound asymmetry ratio ($R_{byte} > 500:1$) & Isolation Forest | **T1048** |
+| Category | Signal | Mechanism | MITRE ATT&CK |
+|---|---|---|---|
+| Volumetric / protocol DDoS | Incomplete TCP handshakes, UDP amplification | Connection-state tracking, packet-volume thresholds | T1498 |
+| Botnet C2 beaconing | Periodic inter-arrival timing | Sliding-window mean/stddev/jitter on connection timing | T1071 |
+| DGA & DNS tunnelling | Query entropy, length, record type | Domain entropy scoring, CNN classifier, TXT/hex parsing | T1568.002 / T1071.004 |
+| Encrypted malware sessions | TLS metadata only, no decryption | JA4 fingerprint matching, SNI entropy | T1071.001 / T1573.002 |
+| Reconnaissance / port scans | Fan-out across ports or hosts | Stateful vertical/horizontal scan tracking | T1046 |
+| Data exfiltration | Outbound/inbound byte asymmetry | Byte-ratio thresholds | T1048 |
 
----
+Detection thresholds are constants in `inference/rules.py` (the malicious-JA4-fingerprint list is the one exception, configurable via an environment variable); the dashboard's Network page only filters what's *displayed*, not what's detected.
 
-##  Quality-of-Life (QoL) & Advanced Capabilities
+## Repository layout
 
-1. ** Interactive Attack Graph & Threat Map**:
-   - Visualizes internal compromised hosts connecting to external C2 nodes / drop-sites using interactive Plotly network topology graphs.
-2. ** Automated SOC Incident Response Playbooks**:
-   - Tailored remediation playbooks with copyable firewall ACL commands (`iptables` / ACLs), forensic checklists, and MITRE mitigation mappings.
-3. ** Live Hackathon Demo Attack Injector**:
-   - 1-click on-demand attack triggers in the UI allowing judges to inject Cobalt Strike handshakes, DGA storms, 75MB exfiltration bursts, and SYN floods.
-4. ** Executive Forensic Incident Report**:
-   - One-click generated executive Markdown / CSV incident response audit summaries.
-5. ** Real-time Detection Configuration**:
-   - Dynamic threshold tuning sliders (Entropy cutoffs, Byte asymmetry ratios, Beaconing jitter tolerances) without restarting workers.
+```
+api/            FastAPI backend, auth, ORM models, Kafka→Postgres sink
+inference/      Stream processor, detection rules, ML models, correlation
+ingest/         Log tailer, PCAP ingester, synthetic traffic simulator
+shared/         Code shared between the dashboard and terminal console
+dashboard/      Streamlit web UI
+terminal/       Textual-based terminal console
+scripts/        Training, topic setup, dev cert generation, integrity checks
+k8s/            Kubernetes manifests (NetworkPolicy, Kyverno, HPA, etc.)
+tests/          pytest suite (unit + integration + load)
+docs/           Model methodology, rotation policy, threat taxonomy
+```
 
----
+## Requirements
 
-##  Performance & Benchmarks (Apple Silicon ARM64)
+- Python 3.12 (CI target; 3.10+ generally works)
+- Docker and Docker Compose (Redpanda, Postgres, Redis)
+- `make` (optional, wraps the commands below)
 
-- **Median Decision Latency (P50)**: **`22.75 µs` (`0.023 ms`)**
-- **Sustained Flow Rate**: **`>225 flows/second`** (single-thread worker)
-- **Wire Equivalent Bandwidth**: **`17.48 Mbps` sustained metadata telemetry**
-- **Memory Footprint**: `< 120 MB RAM`
-- **Automated Regression Suite**: `9/9 Tests Passed in 0.184s`
+## Configuration
 
----
+Copy `.env.example` to `.env` and fill in the required values. At minimum, the API and stream processor will refuse to start without:
 
-## Quickstart: How to Run the SOC
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string |
+| `TSOC_API_KEY` | Static service-to-service credential (dashboard → API) |
+| `TSOC_JWT_SECRET` | HS256 signing secret, ≥32 bytes (RFC 7518 §3.2) |
+| `REDIS_PASSWORD` | Required whenever `REDIS_SSL=true` (the default) |
 
-To launch the full architecture on your local machine, open 5 separate terminal windows and run these commands in order:
+See `.env.example` for the full list, including optional CORS, proxy-trust, and docs-exposure settings.
+
+For local TLS on Redis, generate self-signed dev certificates with:
 
 ```bash
-# 1. Start the Kafka/Redpanda Message Broker
-docker compose up -d
-
-# 2. Start the AI Stream Processor (Terminal 1)
-export PYTHONPATH=$(pwd)
-venv/bin/faust -A inference.stream_processor_faust worker -l info
-
-# 3. Start the FastAPI Database Backend (Terminal 2)
-venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000
-
-# 4. Start the Web & Terminal Dashboards (Terminals 3 and 4)
-venv/bin/streamlit run dashboard/app.py
-venv/bin/python3 terminal/tsoc_console.py
-
-# 5. Execute the Simulated Attack Traffic (Terminal 5)
-venv/bin/python3 ingest/simulator.py --burst
+scripts/generate_dev_certs.sh
 ```
 
----
+## Running locally
 
-## How to Update & Retrain the AI Model
+```bash
+# 1. Infrastructure (Redpanda, Postgres, Redis)
+make up            # or: docker compose up -d
 
-This repository ships with a pre-trained, 100% accurate PyTorch 1D-CNN locked by a cryptographic SHA-256 hash (`models/cnn_dga.pt`). 
+# 2. Stream processor
+make pipeline       # or: venv/bin/python3 inference/stream_processor_faust.py worker -l info
 
-If you believe the model has become outdated against new Dictionary DGAs or Typosquatting techniques, you do not need to manually gather new data. This project includes an **Infinite Procedural Auto-Trainer** that algorithmically generates millions of new, unseen attack vectors.
+# 3. API
+make api            # or: venv/bin/uvicorn api.main:app --host 0.0.0.0 --port 8000
 
-To retrain the model and automatically deploy the new cryptographic hash to the production pipeline, simply run:
+# 4. Dashboards (separate terminals)
+make dashboard       # or: venv/bin/streamlit run dashboard/app.py
+venv/bin/python3 terminal/tsoc_console.py
+
+# 5. Synthetic traffic
+make simulate        # or: venv/bin/python3 ingest/simulator.py --scenario mixed --burst
+```
+
+`make down` tears down the Docker infrastructure; `make clean` removes local `__pycache__`/log artifacts.
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+PYTHONPATH=. pytest tests/ -v --cov=api --cov=inference --cov=shared --cov=ingest --cov-report=term-missing
+```
+
+CI runs this on every push to `main`, alongside:
+
+- `flake8` (blocking on genuine bugs — undefined names, syntax errors; full style report is advisory)
+- `bandit` (fails on high-severity findings)
+- `kubeconform` against every manifest in `k8s/`
+- a Docker build + Trivy scan (fails on HIGH/CRITICAL, unfixed CVEs ignored)
+- CycloneDX SBOM generation
+- keyless Sigstore signing + verification of the tracked model files
+- a concurrent load test (`tests/test_load.py`) exercising the real correlation engine under burst traffic
+
+See [SECURITY.md](SECURITY.md) for exactly what each of these verifies, current coverage numbers, and what still requires infrastructure this repository doesn't ship with (a live cluster, a real TLS-issuing domain).
+
+## Retraining the models
+
+Models are PyTorch, traced with TorchScript, and locked by a tracked SHA-256 sidecar (`models/*.pt.sha256`) that the stream processor verifies before loading.
+
+To regenerate them against fresh synthetic data:
 
 ```bash
 export PYTHONPATH=$(pwd)
 venv/bin/python3 scripts/continuous_training.py
 ```
 
-Let it run for 1 or 2 cycles. Once it hits a Validation Accuracy you are satisfied with (e.g., 99%+), press `Ctrl+C`. The script will automatically perform an atomic swap, updating `models/cnn_dga.pt` and `models/cnn_dga.pt.sha256` without crashing the live stream processors.
-# trigger
+Let it run for one or two cycles and stop it (`Ctrl+C`) once validation accuracy is acceptable. It atomically swaps `models/cnn_dga.pt` and its `.sha256` without disrupting a running stream processor. `scripts/train_dl_models.py` is a shorter, one-shot alternative for both the DGA classifier and the flow autoencoder.
 
-## Trusted Proxy / CIDR Allow-list
+## Security
 
-TRUSTED_PROXY_CIDRS default: 127.0.0.1/32,::1/128,10.244.0.0/16
-Block overly broad (IPv4 <8, IPv6 <64) and global 0.0.0.0/0, ::/0
-Strict allow-list only; never allow /0-/7 prefixes.
+- JWT auth (PyJWT, HS256) with scoped tokens, plus a static service key for internal callers.
+- Rate limiting (slowapi) backed by Redis.
+- Kafka payloads validated against a strict schema before touching the database — no mass-assignment path from an untrusted message to the ORM.
+- Model files are integrity-checked (SHA-256) before load and keylessly signed/verified via Sigstore in CI.
+- Dependency vulnerabilities are scanned continuously via Dependabot (`pip` + `github-actions`).
 
+Full details, current gaps, and how to independently verify the model signatures yourself: [SECURITY.md](SECURITY.md).
 
-## Security Hardening (Post-Audit Remediation)
-- JWT scopes implemented; rotate `TSOC_JWT_SECRET` every 90 days.
-- All default passwords removed; inject via Vault / Sealed Secrets.
-- Kafka messages validated against `AlertPayload`; max 5MB.
-- Readiness probe is shallow (`/readyz`) to prevent DB pool exhaustion.
+## Deployment
 
-## Operational Security (Post-Audit)
-- Secret rotation: rotate TSOC_JWT_SECRET and REDIS_PASSWORD every 90 days via Vault.
-- DLQ overflow: if DLQ exceeds MAX_SIZE_MB, alert on-call; rotate manually.
-- Deployment checklist: verify NetworkPolicy, securityContext, HTTPS URLs before deploy.
+Kubernetes manifests are in `k8s/`: NetworkPolicies (default-deny plus explicit allow rules), a Kyverno `ClusterPolicy` requiring signed images, `HorizontalPodAutoscaler`s for the API and Kafka sink, a KEDA `ScaledObject` for the stream processor, and a `PodDisruptionBudget` for all three. The stream processor is a `StatefulSet`, not a `Deployment`, since its DLQ volume is `ReadWriteOnce`. `k8s/secrets.yaml.example` is a template — populate a real `k8s/secrets.yaml` via Vault/Sealed Secrets, never commit it directly.
