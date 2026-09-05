@@ -672,9 +672,16 @@ class TestSOCPipelineSecurity(unittest.TestCase):
         self.assertEqual(resp_openapi.status_code, 404)
 
     def test_executor_shutdown_timeout(self):
-        """Verify _EXECUTOR_SHUTDOWN_TIMEOUT is tuned to Kubernetes lifecycle margin."""
+        """Verify _EXECUTOR_SHUTDOWN_TIMEOUT is tuned to Kubernetes lifecycle
+        margin AND is actually used -- previously declared with a comment
+        describing exactly this bound, but _on_before_shutdown's
+        asyncio.wait_for called a hardcoded 15.0 instead, so the constant
+        was dead."""
+        import inspect
         from inference import stream_processor_faust
         self.assertEqual(stream_processor_faust._EXECUTOR_SHUTDOWN_TIMEOUT, 45)
+        source = inspect.getsource(stream_processor_faust._on_before_shutdown)
+        self.assertIn("_EXECUTOR_SHUTDOWN_TIMEOUT", source)
 
     def test_cilium_policy_coverage(self):
         """Verify Cilium network policies cover all three core deployments."""

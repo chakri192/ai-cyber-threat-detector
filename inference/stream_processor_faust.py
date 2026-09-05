@@ -92,15 +92,6 @@ _infer_sem = _LazySemaphore(4)
 _infer_pending_sem = _LazySemaphore(8)
 
 
-async def _run_with_timeout(loop, executor, func, *args, timeout=5.0):
-    future = loop.run_in_executor(executor, func, *args)
-    try:
-        return await asyncio.wait_for(future, timeout=timeout)
-    except asyncio.TimeoutError:
-        future.cancel()
-        raise
-
-
 @app.page('/healthz')
 async def healthz(web, request):
     return web.json({'status': 'ok'})
@@ -379,7 +370,11 @@ async def _on_before_shutdown(sender=None, **kwargs):
     # 2. Asynchronously drain and shutdown threadpool executors without blocking the event loop
     loop = asyncio.get_running_loop()
     try:
-        await asyncio.wait_for(loop.run_in_executor(None, _shutdown_executors), timeout=15.0)
+        # Previously hardcoded to 15.0, disconnected from
+        # _EXECUTOR_SHUTDOWN_TIMEOUT (45) declared above -- that constant
+        # described this exact bound in its comment ("45s gives a 15s
+        # margin...") but was never actually passed anywhere.
+        await asyncio.wait_for(loop.run_in_executor(None, _shutdown_executors), timeout=_EXECUTOR_SHUTDOWN_TIMEOUT)
     except asyncio.TimeoutError:
         logger.warning("Executor shutdown timed out during Faust teardown; forcing cancellation")
     except Exception as e:

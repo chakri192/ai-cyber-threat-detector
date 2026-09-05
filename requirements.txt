@@ -3,17 +3,27 @@ scikit-learn==1.5.2
 numpy==1.26.4
 pandas==2.2.3
 joblib==1.4.2
-streamlit==1.38.0
-altair==5.4.1
+# 1.38.0 hard-caps pillow<11, which blocks every fix version below --
+# bumped to the earliest version confirmed (via pip's resolver) to allow
+# pillow>=12.
+streamlit==1.51.0
+# Transitive via streamlit, unpinned; resolved to a version with 15 HIGH
+# CVEs (confirmed by Trivy against the built image). Pin explicitly.
+pillow==12.3.0
+altair==5.5.0
 plotly==5.24.1
 rich==13.8.1
-torch==2.4.1
+torch==2.6.0
 scapy==2.6.1
 
-fastapi==0.128.8
+fastapi==0.135.0
+# Transitive via fastapi, unpinned; resolved to 0.52.1, which carries an
+# SSRF/NTLM-credential-theft CVE and a request.form() DoS CVE (confirmed
+# by Trivy against the built image). Pin explicitly to a fixed version.
+starlette==1.6.0
 uvicorn[standard]==0.39.0
 prometheus-client==0.26.0
-prometheus-fastapi-instrumentator==7.1.0
+prometheus-fastapi-instrumentator==8.1.0
 jsonschema[format]==4.25.1
 certifi==2026.7.22
 psycopg2-binary==2.9.9
@@ -29,4 +39,4 @@ idna==3.10
 faust-streaming==0.11.3
 psutil==6.0.0
 python-dateutil==2.9.0.post0
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.4.0
