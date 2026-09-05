@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Turns the manual pip-audit sweep that fixed torch/PyJWT/scapy/pyarrow/
+  # streamlit/faust-streaming/click/idna into a standing process instead of
+  # a one-time snapshot -- without this, the next CVE disclosed against any
+  # of these silently reopens the gap that sweep just closed.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  # Keeps pinned Action versions (e.g. aquasecurity/trivy-action@v0.24.0)
+  # current -- an Action itself can carry a vulnerability, same as a
+  # Python dependency.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
