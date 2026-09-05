@@ -68,21 +68,26 @@ which was a plain SHA-256 hex digest, not a signature.
 
 ## Test coverage
 
-Real coverage as of the last local measurement: **66%** across
-`api/`, `inference/`, `shared/`, `ingest/` (118 tests). CI's
-`--cov-fail-under` gate tracks this, set with a margin below the local
-number rather than pinned exactly to it. The thinnest remaining areas:
+Real coverage as of the last local measurement: **72%** across
+`api/`, `inference/`, `shared/`, `ingest/` (132 tests, including a real
+Kafka-message → DB → authenticated-API integration suite in
+`tests/integration/`). CI's `--cov-fail-under` gate tracks this, set
+with a margin below the local number rather than pinned exactly to it.
 
-- `api/kafka_sink.py`'s `run_sink()` consumer loop itself (the
-  validate-before-ORM logic it calls, `process_batch`, is directly
-  tested — the outer poll/commit/backoff loop is only reachable through
-  a live Kafka consumer).
-- `inference/stream_processor_faust.py`'s `process_traffic` agent body
-  — the core detection pipeline is exercised end-to-end by
-  `tests/test_load.py` against a real (fakeredis-backed) correlator, but
-  not unit-tested branch-by-branch inside the Faust agent itself.
-- `shared/data_access.py`'s polling loop internals beyond the
-  config-loading and health-flagging paths already covered.
+`api/kafka_sink.py`'s `run_sink()` consumer loop and
+`inference/stream_processor_faust.py`'s `process_traffic` agent — both
+previously only exercised end-to-end via `tests/test_load.py`'s real
+burst test, with no branch-level unit coverage of their own — are now
+driven directly: `run_sink()` via a fake `KafkaConsumer` whose `poll()`
+sends the test process a real `SIGINT` once its scripted messages are
+exhausted (the loop has no other externally-settable stop condition);
+`process_traffic` via Faust's `Agent.fun`, which reaches the original
+undecorated async function so it can be called with a fake async
+stream, no live Faust app or broker required.
+
+The thinnest remaining area is `shared/data_access.py`'s polling-loop
+internals beyond the config-loading and health-flagging paths already
+covered.
 
 ## Dependency scanning
 
@@ -92,14 +97,71 @@ weekly against both the `pip` and `github-actions` ecosystems so that
 state doesn't silently rot the next time a new CVE is disclosed against
 something already pinned here.
 
-## K8s manifest validation
+## K8s manifest validation and live enforcement
 
 Every manifest in `k8s/*.yaml` is checked with
 [`kubeconform`](.github/workflows/ci.yml) on every CI run
 (`-ignore-missing-schemas` skips CRDs with no public schema — Cilium
 `CiliumNetworkPolicy`, Kyverno `ClusterPolicy`, Prometheus
 `ServiceMonitor`). This confirms every manifest is structurally valid
-Kubernetes YAML; it does not confirm runtime enforcement (see below).
+Kubernetes YAML; it does not by itself confirm runtime enforcement.
+
+Runtime enforcement of the two highest-stakes manifests has been
+verified directly against a real local cluster (`kind` + Cilium as the
+CNI, matching this repo's `CiliumNetworkPolicy` usage, + Kyverno
+installed via its official Helm chart) — not just schema-checked:
+
+- **`k8s/network-policies.yaml`**: from a pod labeled
+  `app: tsoc-stream-processor` with the real policy applied, a raw TCP
+  connection to `169.254.169.254:443` (the cloud-metadata range this
+  policy's `except` clause excludes — the exact class of bug the
+  original audit found, where a "deny" policy was actually an unrestricted
+  allow rule to this range) timed out — silently dropped at the CNI layer
+  — while the same pod reached `1.1.1.1:443` (a real public IP, *not* in
+  any excluded range) successfully, from the same node, same code path,
+  moments apart. Default-deny was confirmed separately: an unlabeled pod
+  could not reach a plain target pod at all, and only a pod labeled to
+  match `ingress-nginx` (in a namespace labeled accordingly) could reach
+  the `tsoc-api`-labeled pod's port 8000 — an unlabeled pod could not.
+- **`k8s/kyverno-verify.yaml`**: applying a pod with a mutable image tag
+  and no `imagePullPolicy: Always` into the `tsoc` namespace was rejected
+  by the admission webhook with both rules' exact validation messages
+  (`require-digest-pin`, `require-signed-images`). The identical pod spec
+  applied to `kube-system` was allowed — confirming the namespace-scoping
+  fix actually prevents the cluster-wide outage the original,
+  cluster-wide version of this policy would have caused (CoreDNS,
+  ingress-nginx, cert-manager, and the CNI itself all run unpinned,
+  non-`Always` images there). A pod using a real digest reference and
+  `imagePullPolicy: Always` in `tsoc` was allowed.
+
+This was a one-time interactive verification (the cluster is not
+persisted — spinning up kind+Cilium+Kyverno on every CI run would be
+slow and is not currently wired in), reproducible with: `kind create
+cluster` (CNI disabled) → `cilium install` → apply
+`network-policies.yaml` + `cilium-identity-policy.yaml` → `helm install
+kyverno` → apply `kyverno-verify.yaml` → the connectivity/admission
+tests described above.
+
+## Internal TLS (no public domain required)
+
+`k8s/ingress.yaml` previously pointed at `letsencrypt-prod` for
+`api.tsoc.local` — a hostname that was never going to pass ACME
+validation, since it isn't a real, publicly-resolvable domain. Rather
+than requiring one, `k8s/cert-manager-internal-ca.yaml` sets up a
+cluster-local CA (a one-time self-signed bootstrap issuer signs a root
+CA certificate; a second `ClusterIssuer` of kind `ca` issues real
+workload certificates from that root), and the ingress now references
+that issuer instead. This is the architecturally correct choice here,
+not a fallback: this platform sits behind a data diode and is never
+meant to be internet-facing, so a publicly-trusted certificate is the
+wrong tool regardless of whether a public domain is available.
+
+Verified against a real cert-manager installation (Helm chart, a fresh
+`kind` cluster): the bootstrap issuer, root CA certificate, and workload
+issuer all reached `Ready`, and a real `Certificate` requested for
+`api.tsoc.local` was issued — `kubectl get secret ... | openssl x509
+-noout -issuer -ext subjectAltName` shows `issuer=CN=tsoc-internal-ca`
+and `DNS:api.tsoc.local`, a genuine, cluster-trusted X.509 certificate.
 
 ## Secret rotation
 
@@ -112,19 +174,14 @@ Kubernetes YAML; it does not confirm runtime enforcement (see below).
 
 ## Genuinely out of scope here
 
-These require real infrastructure this sandbox/CI environment doesn't
-have, and are not claimed as verified:
-
-- **Live cluster enforcement.** `kubeconform` proves every manifest is
-  schema-valid; it cannot prove a `NetworkPolicy` actually blocks the
-  traffic it claims to at runtime, or that Kyverno's `ClusterPolicy`
-  actually rejects an unsigned image on a real admission request. That
-  needs a live Kubernetes cluster with Cilium/Kyverno installed.
-- **Real TLS certificate issuance** for any of the `*.tsoc.local`
-  hostnames referenced in configuration — those are placeholders for a
-  real domain and a real CA (or ACME) this project doesn't own.
 - **A genuinely offline/air-gapped signing key**, as opposed to the
   keyless Sigstore flow above (which depends on reaching the public
-  Fulcio/Rekor services from the CI runner). `scripts/sign_manifest.py`
+  Fulcio/Rekor services from the CI runner or verifier). `scripts/sign_manifest.py`
   documents this alternative and correctly refuses to run without a real
   persistent key rather than fabricate one.
+- **A persistent, CI-integrated live cluster.** The NetworkPolicy/Kyverno
+  enforcement described above was verified interactively against a real
+  local cluster, not asserted from schema validation alone — but that
+  cluster isn't kept running or wired into CI, so a manifest change after
+  this was written isn't automatically re-verified at that level (schema
+  validation via `kubeconform` still runs on every push).

@@ -16,14 +16,15 @@ metadata:
     nginx.ingress.kubernetes.io/auth-snippet: |
       proxy_intercept_errors on;
       error_page 401 403 500 502 503 504 =401 /error-auth;
-    # NOTE: letsencrypt-prod cannot issue a certificate for api.tsoc.local
-    # unless that hostname is a real, publicly-resolvable domain pointed at
-    # this ingress -- .local / example hostnames will fail ACME HTTP-01/
-    # DNS-01 validation. Replace api.tsoc.local (here and in `spec.tls` /
-    # `spec.rules` below) with a real domain before relying on this
-    # cluster-issuer, or swap in an internal ClusterIssuer for non-public
-    # deployments.
-    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # api.tsoc.local is not a real, publicly-resolvable domain, so a public
+    # ACME issuer (letsencrypt-prod) could never validate it -- and
+    # shouldn't be asked to: this platform sits behind a data diode and is
+    # never meant to be internet-facing, so a publicly-trusted cert isn't
+    # the right tool regardless. tsoc-internal-ca-issuer (see
+    # k8s/cert-manager-internal-ca.yaml) issues from a cluster-local CA
+    # instead -- verified end-to-end against a real cert-manager
+    # installation (see SECURITY.md).
+    cert-manager.io/cluster-issuer: "tsoc-internal-ca-issuer"
     nginx.ingress.kubernetes.io/auth-tls-verify-client: "on"
     nginx.ingress.kubernetes.io/auth-tls-secret: "tsoc/client-cert"
     nginx.ingress.kubernetes.io/auth-tls-verify-depth: "1"

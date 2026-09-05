@@ -1,7 +1,7 @@
 import unittest
 import asyncio
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import fakeredis
 
@@ -954,6 +954,128 @@ class TestSOCPipelineSecurity(unittest.TestCase):
         finally:
             sp._shutdown_executors = orig_shutdown
             sp._EXECUTOR_SHUTDOWN_TIMEOUT = orig_timeout
+
+    # ----------------------------------------------------------------
+    # process_traffic() is the core detection agent -- previously only
+    # covered end-to-end via test_load.py's real burst test. Faust wraps
+    # it in an Agent object, but the original async function is still
+    # reachable via `.fun`, so it's callable directly with a fake async
+    # stream, without needing a live Faust app/broker.
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    async def _fake_stream(events):
+        for e in events:
+            yield e
+
+    def test_process_traffic_happy_path_publishes_with_force_true(self):
+        import inference.stream_processor_faust as sp
+
+        event = {"event_type": "conn", "id.orig_h": "10.0.0.5", "id.resp_h": "10.0.0.9", "uid": "C1"}
+        detection = {"threat_class": "Port Scanning", "severity": "medium", "confidence": 0.8, "rule_id": "TEST_RULE"}
+
+        async def _run():
+            with patch.object(sp, "extract_features", return_value={}), \
+                 patch.object(sp, "evaluate_rules", return_value=[detection]), \
+                 patch.object(sp, "validate_alert", return_value=(True, None)), \
+                 patch.object(sp.enricher, "enrich", new=AsyncMock(side_effect=lambda a: a)), \
+                 patch.object(sp.alerts_topic, "send", new=AsyncMock(return_value=None)) as alerts_send, \
+                 patch.object(sp.correlator, "add_alert", return_value=None), \
+                 patch.object(sp.incidents_topic, "send", new=AsyncMock(return_value=None)) as incidents_send, \
+                 patch.object(sp, "_send_dlq_safely", new=AsyncMock()) as dlq:
+                await sp.process_traffic.fun(self._fake_stream([event]))
+
+            alerts_send.assert_awaited_once()
+            self.assertTrue(alerts_send.call_args.kwargs.get("force"))
+            incidents_send.assert_not_awaited()  # add_alert returned None -> no incident
+            dlq.assert_not_awaited()
+
+        asyncio.run(_run())
+
+    def test_process_traffic_invalid_alert_schema_routes_to_dlq_not_kafka(self):
+        import inference.stream_processor_faust as sp
+
+        event = {"event_type": "conn", "id.orig_h": "10.0.0.5", "id.resp_h": "10.0.0.9", "uid": "C2"}
+        detection = {"threat_class": "Port Scanning", "severity": "medium", "confidence": 0.8, "rule_id": "TEST_RULE"}
+
+        async def _run():
+            with patch.object(sp, "extract_features", return_value={}), \
+                 patch.object(sp, "evaluate_rules", return_value=[detection]), \
+                 patch.object(sp, "validate_alert", return_value=(False, "missing field")), \
+                 patch.object(sp.enricher, "enrich", new=AsyncMock(side_effect=lambda a: a)), \
+                 patch.object(sp.alerts_topic, "send", new=AsyncMock(return_value=None)) as alerts_send, \
+                 patch.object(sp, "_send_dlq_safely", new=AsyncMock()) as dlq:
+                await sp.process_traffic.fun(self._fake_stream([event]))
+
+            alerts_send.assert_not_awaited()  # never reaches Kafka
+            dlq.assert_awaited_once()
+            self.assertIn("SchemaValidationError", dlq.call_args.args[2])
+
+        asyncio.run(_run())
+
+    def test_process_traffic_kafka_publish_timeout_routes_to_dlq_without_touching_redis(self):
+        import inference.stream_processor_faust as sp
+
+        event = {"event_type": "conn", "id.orig_h": "10.0.0.5", "id.resp_h": "10.0.0.9", "uid": "C3"}
+        detection = {"threat_class": "Port Scanning", "severity": "medium", "confidence": 0.8, "rule_id": "TEST_RULE"}
+
+        async def _run():
+            with patch.object(sp, "extract_features", return_value={}), \
+                 patch.object(sp, "evaluate_rules", return_value=[detection]), \
+                 patch.object(sp, "validate_alert", return_value=(True, None)), \
+                 patch.object(sp.enricher, "enrich", new=AsyncMock(side_effect=lambda a: a)), \
+                 patch.object(sp.alerts_topic, "send", new=AsyncMock(side_effect=asyncio.TimeoutError())), \
+                 patch.object(sp.correlator, "add_alert") as add_alert, \
+                 patch.object(sp, "_send_dlq_safely", new=AsyncMock()) as dlq:
+                await sp.process_traffic.fun(self._fake_stream([event]))
+
+            add_alert.assert_not_called()  # Redis must never be touched pre-commit
+            dlq.assert_awaited_once()
+            self.assertIn("Timeout during alert Kafka publish", dlq.call_args.args[2])
+
+        asyncio.run(_run())
+
+    def test_process_traffic_redis_error_after_commit_routes_to_dlq(self):
+        import redis
+        import inference.stream_processor_faust as sp
+
+        event = {"event_type": "conn", "id.orig_h": "10.0.0.5", "id.resp_h": "10.0.0.9", "uid": "C4"}
+        detection = {"threat_class": "Port Scanning", "severity": "medium", "confidence": 0.8, "rule_id": "TEST_RULE"}
+
+        async def _run():
+            with patch.object(sp, "extract_features", return_value={}), \
+                 patch.object(sp, "evaluate_rules", return_value=[detection]), \
+                 patch.object(sp, "validate_alert", return_value=(True, None)), \
+                 patch.object(sp.enricher, "enrich", new=AsyncMock(side_effect=lambda a: a)), \
+                 patch.object(sp.alerts_topic, "send", new=AsyncMock(return_value=None)) as alerts_send, \
+                 patch.object(sp.correlator, "add_alert", side_effect=redis.RedisError("boom")), \
+                 patch.object(sp, "_send_dlq_safely", new=AsyncMock()) as dlq:
+                await sp.process_traffic.fun(self._fake_stream([event]))
+
+            # The alert was already durably published before Redis failed --
+            # this is the two-phase-commit ordering the code's own comments
+            # describe: Kafka first, Redis only after.
+            alerts_send.assert_awaited_once()
+            dlq.assert_awaited_once()
+            self.assertIn("RedisUnavailable", dlq.call_args.args[2])
+
+        asyncio.run(_run())
+
+    def test_process_traffic_feature_extraction_failure_skips_event_without_crashing(self):
+        import inference.stream_processor_faust as sp
+
+        event = {"event_type": "conn", "id.orig_h": "10.0.0.5", "id.resp_h": "10.0.0.9", "uid": "C5"}
+
+        async def _run():
+            with patch.object(sp, "extract_features", side_effect=RuntimeError("boom")), \
+                 patch.object(sp, "evaluate_rules") as rules_mock, \
+                 patch.object(sp.alerts_topic, "send", new=AsyncMock()) as alerts_send:
+                await sp.process_traffic.fun(self._fake_stream([event]))  # must not raise
+
+            rules_mock.assert_not_called()
+            alerts_send.assert_not_awaited()
+
+        asyncio.run(_run())
 
 if __name__ == '__main__':
     unittest.main()

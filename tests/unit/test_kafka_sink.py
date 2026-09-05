@@ -210,3 +210,98 @@ class TestDlqHelpers:
         monkeypatch.setattr(sink, "DLQ_MAX_SIZE_MB", 0)
         monkeypatch.setattr(sink.os.path, "getsize", MagicMock(side_effect=OSError("disk error")))
         _rotate_dlq_if_needed()  # must not raise
+
+
+class TestRunSink:
+    """run_sink() is a while-True consumer loop with no externally settable
+    stop condition except its own SIGTERM/SIGINT handler -- so these tests
+    drive it with a fake KafkaConsumer whose poll() sends the process a
+    real SIGINT after the scenario's messages are exhausted, exercising
+    the actual loop body (poll -> batch -> process_batch -> commit ->
+    graceful-shutdown) rather than just the functions it calls."""
+
+    def _run_with_messages(self, monkeypatch, message_batches, commit_side_effect=None):
+        import os
+        import signal
+        import api.kafka_sink as sink
+
+        calls = {"n": 0}
+        committed_offsets = []
+
+        def fake_poll(timeout_ms=1000):
+            calls["n"] += 1
+            if calls["n"] <= len(message_batches):
+                return message_batches[calls["n"] - 1]
+            os.kill(os.getpid(), signal.SIGINT)
+            return {}
+
+        fake_consumer = MagicMock()
+        fake_consumer.poll.side_effect = fake_poll
+        if commit_side_effect is not None:
+            fake_consumer.commit.side_effect = commit_side_effect
+        else:
+            fake_consumer.commit.side_effect = lambda offsets: committed_offsets.append(offsets)
+
+        monkeypatch.setattr(sink, "KafkaConsumer", MagicMock(return_value=fake_consumer))
+        monkeypatch.setattr(sink, "get_dlq_producer", lambda: None)
+        monkeypatch.setattr(sink.time, "sleep", lambda s: None)
+
+        sink.run_sink()  # must return, not hang, once SIGINT is delivered
+        return fake_consumer, committed_offsets
+
+    @staticmethod
+    def _kafka_message(alert_id, offset):
+        msg = MagicMock()
+        msg.value = json.dumps({
+            "alert_id": alert_id, "event_type": "dns", "timestamp": "t",
+            "threat_class": "DGA", "severity": "high",
+            "confidence_score": 0.9, "source_ip": "1.2.3.4",
+        }).encode()
+        msg.offset = offset
+        return msg
+
+    def test_run_sink_processes_a_batch_and_commits_then_shuts_down(self, monkeypatch):
+        batch = {"tp0": [self._kafka_message("ALT-runsink-1", 0)]}
+        consumer, committed = self._run_with_messages(monkeypatch, [batch])
+
+        assert len(committed) == 1
+        assert committed[0]["tp0"].offset == 1
+        consumer.close.assert_called_once_with(autocommit=False)
+
+        db = SessionLocal()
+        try:
+            assert db.query(Alert).filter(Alert.alert_id == "ALT-runsink-1").first() is not None
+        finally:
+            db.close()
+
+    def test_run_sink_advances_offset_past_a_poisoned_message(self, monkeypatch):
+        poisoned = MagicMock()
+        poisoned.value = b"not valid json"
+        poisoned.offset = 7
+        batch = {"tp0": [poisoned]}
+        _, committed = self._run_with_messages(monkeypatch, [batch])
+
+        # A deserialization failure never reaches process_batch (it's
+        # filtered in the poll loop itself) but must still advance past
+        # the bad offset -- the "stale partition offsets" commit path.
+        assert any(c.get("tp0") is not None and c["tp0"].offset == 8 for c in committed)
+
+    def test_run_sink_survives_a_consumer_poll_error(self, monkeypatch):
+        import api.kafka_sink as sink
+
+        def flaky_poll(timeout_ms=1000):
+            flaky_poll.calls = getattr(flaky_poll, "calls", 0) + 1
+            if flaky_poll.calls == 1:
+                raise RuntimeError("broker hiccup")
+            import os
+            import signal
+            os.kill(os.getpid(), signal.SIGINT)
+            return {}
+
+        fake_consumer = MagicMock()
+        fake_consumer.poll.side_effect = flaky_poll
+        monkeypatch.setattr(sink, "KafkaConsumer", MagicMock(return_value=fake_consumer))
+        monkeypatch.setattr(sink, "get_dlq_producer", lambda: None)
+        monkeypatch.setattr(sink.time, "sleep", lambda s: None)
+
+        sink.run_sink()  # must not crash on a poll() exception

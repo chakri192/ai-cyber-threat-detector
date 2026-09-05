@@ -44,19 +44,19 @@ jobs:
         run: bandit -r api inference ingest shared scripts -lll -ii -f json -o bandit-report.json
 
       - name: Unit tests + coverage (fail if any error, or coverage regresses)
-        # 40% was barely above the real floor at the time it was set (48%).
-        # Real coverage is now 66% locally (65 -> 118 tests) after adding
-        # direct tests for api/kafka_sink.py's mass-assignment validation
-        # path, inference/train_model.py's .sha256 sidecar, the ingest
-        # simulator/tailer, inference/playbooks.py's RFC1918 fix, and
-        # stream_processor_faust.py's DLQ fallback/shutdown paths -- all
-        # previously at 0-37% despite carrying real fixes. 60 leaves a
-        # margin for the real Python-3.12 CI runner while still being a
-        # gate that would actually catch a coverage regression.
+        # Real coverage is now 72% locally (132 tests) after also driving
+        # api/kafka_sink.py's run_sink() consumer loop and
+        # stream_processor_faust.py's process_traffic() agent directly
+        # (fake KafkaConsumer + a real SIGINT for the former, Faust's
+        # Agent.fun to reach the undecorated function for the latter) --
+        # both previously only exercised end-to-end via test_load.py, with
+        # no unit-level coverage of their own branches. 65 leaves a margin
+        # for the real Python-3.12 CI runner while still being a gate that
+        # would actually catch a coverage regression.
         run: |
           PYTHONPATH=. pytest tests/ -v --tb=short --durations=10 \
             --cov=api --cov=inference --cov=shared --cov=ingest \
-            --cov-report=term-missing --cov-report=xml --cov-fail-under=60
+            --cov-report=term-missing --cov-report=xml --cov-fail-under=65
 
       - name: Model integrity verification (real digest check)
         run: |

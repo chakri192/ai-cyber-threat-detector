@@ -1,0 +1,52 @@
+# Internal (non-public) certificate authority for cert-manager.
+#
+# k8s/ingress.yaml previously pointed at `letsencrypt-prod`, which cannot
+# actually issue anything here: `api.tsoc.local` (and every other
+# *.tsoc.local hostname this repo uses) is not a real, publicly-resolvable
+# domain, so ACME HTTP-01/DNS-01 validation would fail every time. That was
+# already noted in a comment on that file but never resolved.
+#
+# This platform is also meant to sit behind a data diode / passive tap --
+# its API and dashboard are internal-only by design and should never be
+# reachable from the public internet. A publicly-trusted CA is the wrong
+# tool for that regardless of domain ownership: it would mean exposing an
+# internal monitoring tool to get a cert the public internet has no reason
+# to ever see. An internal CA is the architecturally correct choice, not a
+# fallback -- nothing outside this cluster needs to trust these certs.
+#
+# Bootstrap chain: a one-time self-signed issuer signs a root CA
+# certificate; a second issuer (of kind `ca`) then issues real workload
+# certificates from that root. Requires cert-manager installed
+# (helm install cert-manager jetstack/cert-manager --set crds.enabled=true).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: tsoc-selfsigned-bootstrap
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tsoc-internal-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: tsoc-internal-ca
+  secretName: tsoc-internal-ca-secret
+  duration: 87600h  # 10 years -- a root CA is rotated deliberately, not on a short timer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: tsoc-selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: tsoc-internal-ca-issuer
+spec:
+  ca:
+    secretName: tsoc-internal-ca-secret
