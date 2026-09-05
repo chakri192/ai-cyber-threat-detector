@@ -69,10 +69,12 @@ which was a plain SHA-256 hex digest, not a signature.
 ## Test coverage
 
 Real coverage as of the last local measurement: **72%** across
-`api/`, `inference/`, `shared/`, `ingest/` (132 tests, including a real
+`api/`, `inference/`, `shared/`, `ingest/` (142 tests, including a real
 Kafka-message → DB → authenticated-API integration suite in
-`tests/integration/`). CI's `--cov-fail-under` gate tracks this, set
-with a margin below the local number rather than pinned exactly to it.
+`tests/integration/`, and a subprocess-isolated suite in
+`tests/unit/test_boot_time_checks.py` for the import-time checks below).
+CI's `--cov-fail-under` gate tracks this, set with a margin below the
+local number rather than pinned exactly to it.
 
 `api/kafka_sink.py`'s `run_sink()` consumer loop and
 `inference/stream_processor_faust.py`'s `process_traffic` agent — both
@@ -163,12 +165,26 @@ issuer all reached `Ready`, and a real `Certificate` requested for
 -noout -issuer -ext subjectAltName` shows `issuer=CN=tsoc-internal-ca`
 and `DNS:api.tsoc.local`, a genuine, cluster-trusted X.509 certificate.
 
+## Boot-time configuration checks
+
+Two misconfigurations fail the process at import time rather than
+degrading silently:
+
+- `TSOC_JWT_SECRET`, if set, must be ≥32 bytes (RFC 7518 §3.2 minimum for
+  HS256) — [api/auth.py](api/auth.py) raises `RuntimeError` at import if
+  it's shorter, rather than relying on PyJWT's own `InsecureKeyLengthWarning`
+  (a warning, not a boot failure) at first encode/decode. An entirely
+  *unset* secret still fails lazily, on first use — a deployment using
+  only the static service key was never required to configure one.
+- `DB_SSLMODE` for a `postgresql://` `DATABASE_URL` must be `require`,
+  `verify-ca`, or `verify-full` — [api/database.py](api/database.py)
+  raises at import on `disable`/`allow`/`prefer` instead of silently
+  allowing an unencrypted or unverified connection.
+
 ## Secret rotation
 
 - `TSOC_JWT_SECRET` and `REDIS_PASSWORD`: rotate every 90 days via Vault
   (see [README](README.md#security-hardening-post-audit-remediation)).
-  `TSOC_JWT_SECRET` must be ≥32 bytes (RFC 7518 §3.2 minimum for HS256);
-  PyJWT raises `InsecureKeyLengthWarning` if it's shorter.
 - DLQ overflow: if a local-disk DLQ fallback exceeds its configured max
   size, alert on-call and rotate manually.
 

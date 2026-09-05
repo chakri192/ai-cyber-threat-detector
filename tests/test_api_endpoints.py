@@ -114,3 +114,26 @@ def test_fuzz_auth_header():
     # this is what a real malicious client's raw socket request produces).
     r = client.get("/api/v1/alerts", headers={"Authorization": b"Bearer \xff\xff\xff"})
     assert r.status_code == 401, f"expected 401 for a non-ASCII header, got {r.status_code}"
+
+
+def test_rate_limit_actually_returns_429_past_the_configured_threshold():
+    # @limiter.limit("100/minute") on GET /api/v1/alerts was previously
+    # only ever unit-tested for its key function (proxy spoofing,
+    # exhaustion isolation) -- never proven to actually reject a caller
+    # who exceeds it through the real endpoint. `limiter` is a
+    # process-wide singleton shared with every other test in this
+    # session, so its storage is reset before and after to avoid this
+    # test being polluted by (or polluting) unrelated tests' request counts.
+    from api.deps import limiter
+
+    limiter.reset()
+    try:
+        with TestClient(app) as client:
+            statuses = [
+                client.get("/api/v1/alerts", headers={"Authorization": f"Bearer {API_KEY}"}).status_code
+                for _ in range(105)
+            ]
+        assert statuses.count(200) <= 100
+        assert 429 in statuses
+    finally:
+        limiter.reset()

@@ -15,7 +15,18 @@ engine_kwargs = {
 
 if "postgresql" in SQLALCHEMY_DATABASE_URL:
     connect_args["connect_timeout"] = 5
-    connect_args["sslmode"] = os.getenv("DB_SSLMODE", "verify-full")
+    _db_sslmode = os.getenv("DB_SSLMODE", "verify-full")
+    # The default is secure, but nothing previously stopped DB_SSLMODE from
+    # being explicitly set to "disable"/"allow"/"prefer" -- all of which
+    # either skip encryption entirely or silently downgrade to plaintext if
+    # the server doesn't offer TLS. Fail closed on a weak value instead of
+    # letting a misconfiguration connect unencrypted or unverified.
+    if _db_sslmode not in ("require", "verify-ca", "verify-full"):
+        raise RuntimeError(
+            f"DB_SSLMODE={_db_sslmode!r} is not acceptable for a Postgres "
+            "connection -- must be one of: require, verify-ca, verify-full."
+        )
+    connect_args["sslmode"] = _db_sslmode
     engine_kwargs.update({
         "pool_size": 20,
         "max_overflow": 20,
