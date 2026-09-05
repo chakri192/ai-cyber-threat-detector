@@ -1077,6 +1077,121 @@ class TestSOCPipelineSecurity(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_forwarded_header_is_capped_not_processed_unbounded(self):
+        # A stuffed X-Forwarded-For (thousands of junk entries) previously
+        # had no bound on how many comma-separated segments get split and
+        # validated. Only the last _MAX_XFF_HOPS are considered now.
+        from api.deps import _MAX_XFF_HOPS, get_remote_address
+
+        mock_req = MagicMock()
+        mock_req.client.host = "127.0.0.1"  # trusted proxy
+        # More hops than _MAX_XFF_HOPS but well under the header-length cap
+        # (short entries -- the length cap is exercised separately below),
+        # with a real client IP at the tail, closest to our trusted proxy:
+        # right-to-left parsing must still find it despite the hop cap.
+        junk_hops = ", ".join(f"1.1.1.{i % 250}" for i in range(30))
+        forwarded = f"{junk_hops}, 203.0.113.77, 127.0.0.1"
+        self.assertLess(len(forwarded), 2048)
+        mock_req.headers = {"X-Forwarded-For": forwarded}
+
+        result = get_remote_address(mock_req)  # must not hang or crash
+        self.assertEqual(result, "203.0.113.77")
+
+        # An oversized header is dropped entirely rather than processed at all.
+        mock_req_oversized = MagicMock()
+        mock_req_oversized.client.host = "127.0.0.1"
+        mock_req_oversized.headers = {"X-Forwarded-For": "10.0.0.1, " * 1000}
+        result_oversized = get_remote_address(mock_req_oversized)
+        self.assertEqual(result_oversized, "127.0.0.1")  # falls back to the direct peer
+
+    def test_correlation_id_and_path_are_stamped_onto_real_log_lines(self):
+        # correlation_id/path were previously read via getattr(record, ...,
+        # None) from fields nothing ever set -- every structured log line
+        # logged both as null regardless of which request triggered it.
+        # Drives the real middleware directly (not through a full HTTP
+        # round-trip) so the log line is captured from inside call_next,
+        # the exact window during which the context vars are set --
+        # asserting against a line emitted after the request completes
+        # would just prove the reset() cleanup path, not the propagation.
+        import io
+        import json as _json
+        import logging as _logging
+        from starlette.responses import Response
+        from api.main import request_tracing_middleware, _handler
+
+        buf = io.StringIO()
+        capture_handler = _logging.StreamHandler(buf)
+        capture_handler.setFormatter(_handler.formatter)
+        capture_handler.addFilter(_handler.filters[0])
+        root_logger = _logging.getLogger()
+        root_logger.addHandler(capture_handler)
+
+        fake_request = MagicMock()
+        fake_request.headers = {}
+        fake_request.url.path = "/api/v1/alerts"
+
+        async def _call_next(request):
+            _logging.getLogger("api.main").info("test line during request")
+            return Response(status_code=200)
+
+        try:
+            asyncio.run(request_tracing_middleware(fake_request, _call_next))
+        finally:
+            root_logger.removeHandler(capture_handler)
+
+        lines = [_json.loads(ln) for ln in buf.getvalue().splitlines() if ln.strip()]
+        matching = [ln for ln in lines if ln.get("msg") == "test line during request"]
+        self.assertTrue(matching, "expected the captured log line to appear")
+        self.assertEqual(matching[0]["path"], "/api/v1/alerts")
+        self.assertIsNotNone(matching[0]["correlation_id"])
+        self.assertTrue(matching[0]["correlation_id"].startswith("req-"))
+
+    def test_correlation_id_does_not_leak_across_requests(self):
+        # Context vars are task-local; a value set on one request must not
+        # bleed into logs from a request handled without one (or with a
+        # different id) on the same event loop.
+        import io
+        import json as _json
+        import logging as _logging
+        from starlette.responses import Response
+        from api.main import request_tracing_middleware, _handler
+
+        buf = io.StringIO()
+        capture_handler = _logging.StreamHandler(buf)
+        capture_handler.setFormatter(_handler.formatter)
+        capture_handler.addFilter(_handler.filters[0])
+        root_logger = _logging.getLogger()
+        root_logger.addHandler(capture_handler)
+
+        async def _call_next(request):
+            _logging.getLogger("api.main").info("during handling")
+            return Response(status_code=200)
+
+        try:
+            req_a = MagicMock()
+            req_a.headers = {"X-Request-ID": "req-AAAA"}
+            req_a.url.path = "/a"
+            asyncio.run(request_tracing_middleware(req_a, _call_next))
+
+            _logging.getLogger("api.main").info("outside any request")
+
+            req_b = MagicMock()
+            req_b.headers = {"X-Request-ID": "req-BBBB"}
+            req_b.url.path = "/b"
+            asyncio.run(request_tracing_middleware(req_b, _call_next))
+        finally:
+            root_logger.removeHandler(capture_handler)
+
+        lines = [_json.loads(ln) for ln in buf.getvalue().splitlines() if ln.strip()]
+        during = [ln for ln in lines if ln["msg"] == "during handling"]
+        outside = [ln for ln in lines if ln["msg"] == "outside any request"][0]
+
+        self.assertEqual(during[0]["correlation_id"], "req-AAAA")
+        self.assertEqual(during[0]["path"], "/a")
+        self.assertEqual(during[1]["correlation_id"], "req-BBBB")
+        self.assertEqual(during[1]["path"], "/b")
+        self.assertIsNone(outside["correlation_id"])
+
 if __name__ == '__main__':
     unittest.main()
 # pytest.mark.skip added

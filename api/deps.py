@@ -62,6 +62,15 @@ def _is_trusted_proxy(ip: str) -> bool:
         return False
 
 
+# A stuffed X-Forwarded-For (thousands of comma-separated junk entries)
+# costs a split() + a validation call per entry -- bounded here rather
+# than processing an attacker-controlled string of unbounded size. 2048
+# chars / 20 hops comfortably covers any real proxy chain (20 IPv6
+# addresses alone would be under 1000 chars).
+_MAX_XFF_HEADER_LEN = 2048
+_MAX_XFF_HOPS = 20
+
+
 def get_remote_address(request: Request) -> str:
     # Strict: never trust X-Forwarded-For / X-Real-IP unless immediate peer is verified proxy
     raw_client = request.client.host if request.client else "127.0.0.1"
@@ -69,9 +78,15 @@ def get_remote_address(request: Request) -> str:
     # Only inspect proxy headers when the TCP peer is explicitly from trusted proxy list
     if _is_trusted_proxy(client_ip):
         forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded and len(forwarded) > _MAX_XFF_HEADER_LEN:
+            forwarded = None
         if forwarded:
-            # Parse right-to-left: find the first non-trusted proxy IP
-            ips = [ip.strip() for ip in forwarded.split(",") if ip.strip()]
+            # Parse right-to-left: find the first non-trusted proxy IP.
+            # Only the last _MAX_XFF_HOPS entries are considered -- those
+            # are the ones closest to our own trusted proxy, which is what
+            # right-to-left parsing cares about first regardless of how
+            # many (or how few) genuine hops precede them.
+            ips = [ip.strip() for ip in forwarded.split(",") if ip.strip()][-_MAX_XFF_HOPS:]
             valid_ips = []
             for ip in reversed(ips):
                 valid = _validate_ip(ip)

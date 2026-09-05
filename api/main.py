@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import os
@@ -21,6 +22,26 @@ from api.deps import limiter, get_authenticated_db, verify_auth
 logger = logging.getLogger(__name__)
 
 
+# Request-scoped, not global: contextvars are task-local, so concurrent
+# requests handled on the same event loop each see only their own value --
+# unlike a plain module-level variable, which every in-flight request
+# would share and clobber.
+_correlation_id_ctx = contextvars.ContextVar("correlation_id", default=None)
+_path_ctx = contextvars.ContextVar("path", default=None)
+
+
+class _RequestContextFilter(logging.Filter):
+    """Stamps every log record with the current request's correlation ID
+    and path, previously read via getattr(record, ..., None) from fields
+    nothing ever actually set -- every line logged correlation_id/path as
+    null regardless of which request triggered it."""
+
+    def filter(self, record):
+        record.correlation_id = _correlation_id_ctx.get()
+        record.path = _path_ctx.get()
+        return True
+
+
 class StructuredLogFormatter(logging.Formatter):
     def format(self, record):
         return json.dumps({
@@ -34,6 +55,7 @@ class StructuredLogFormatter(logging.Formatter):
 
 _handler = logging.StreamHandler()
 _handler.setFormatter(StructuredLogFormatter())
+_handler.addFilter(_RequestContextFilter())
 _root_logger = logging.getLogger()
 _root_logger.addHandler(_handler)
 _root_logger.setLevel(logging.INFO)
@@ -80,7 +102,13 @@ async def request_tracing_middleware(request: Request, call_next):
         or f"req-{uuid.uuid4().hex[:16]}"
     )
     request.state.request_id = req_id
-    response = await call_next(request)
+    corr_token = _correlation_id_ctx.set(req_id)
+    path_token = _path_ctx.set(request.url.path)
+    try:
+        response = await call_next(request)
+    finally:
+        _correlation_id_ctx.reset(corr_token)
+        _path_ctx.reset(path_token)
     response.headers["X-Request-ID"] = req_id
     return response
 
