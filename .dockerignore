@@ -18,7 +18,6 @@
 !models/
 !models/*.pt
 !models/*.sha256
-!models/*.sig
 
 **/__pycache__
 **/*.pyc

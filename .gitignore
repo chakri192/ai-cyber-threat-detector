@@ -23,10 +23,17 @@ k8s/secrets.yaml
 test.db
 .env*
 *.bak
-# NOTE: models/*.pt, models/*.sha256, and models/*.sig are intentionally
-# tracked, not ignored -- a previous pass here ignored them as "repo
-# bloat," but they're tiny (the two current models are ~7KB/~99KB
-# combined) and the whole pipeline requires them to exist on a fresh
-# checkout: tests load them, the Dockerfile bakes them into the image,
-# and CI's integrity-verification step needs their .sha256 alongside
-# them. Untracking them broke exactly that on the next clean CI run.
+# NOTE: models/*.pt and models/*.sha256 are intentionally tracked, not
+# ignored -- a previous pass here ignored them as "repo bloat," but
+# they're tiny (the two current models are ~7KB/~99KB combined) and the
+# whole pipeline requires them to exist on a fresh checkout: tests load
+# them, the Dockerfile bakes them into the image, and CI's
+# integrity-verification step needs their .sha256 alongside them.
+# Untracking them broke exactly that on the next clean CI run.
+#
+# models/*.sig was a stale fake artifact (a hex digest, not a real
+# signature) from before real signing existed and has been removed. Real
+# model provenance is now a cosign KEYLESS signature bundle, generated
+# fresh and verified in every CI run (see .github/workflows/ci.yml) --
+# not a static file meant to be committed.
+models/*.cosign.bundle
