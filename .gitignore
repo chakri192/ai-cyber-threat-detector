@@ -1,6 +1,7 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .coverage
 coverage.xml
 bandit-report.json
@@ -16,8 +17,9 @@ soc-stream-processor-cluster-data/
 data/*.db
 data/soc_alerts.*
 
-soc-stream-processor-cluster-data/
-
+# Demo recordings/videos -- real assets, not junk, but binary media
+# permanently bloats git history; kept on disk, just not tracked.
+demos/
 
 k8s/secrets.yaml
 test.db
