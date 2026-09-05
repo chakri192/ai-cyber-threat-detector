@@ -41,7 +41,7 @@ fastapi==0.135.0
 # SSRF/NTLM-credential-theft CVE and a request.form() DoS CVE (confirmed
 # by Trivy against the built image). Pin explicitly to a fixed version.
 starlette==1.6.0
-uvicorn[standard]==0.39.0
+uvicorn[standard]==0.52.4
 prometheus-client==0.26.0
 prometheus-fastapi-instrumentator==8.1.0
 jsonschema[format]==4.25.1
