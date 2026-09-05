@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from jose import jwt
+import jwt
 from typing import List, Optional
 
 JWT_SECRET = os.getenv("TSOC_JWT_SECRET")

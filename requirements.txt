@@ -3,18 +3,38 @@ scikit-learn==1.5.2
 numpy==1.26.4
 pandas==2.2.3
 joblib==1.4.2
-# 1.38.0 hard-caps pillow<11, which blocks every fix version below --
+# 1.38.0 hard-caps pillow<11 (blocks every pillow fix version) and
+# 1.51.0 in turn caps pyarrow<22 (blocks the pyarrow fix version found
+# by a LATER Trivy scan, once pillow/starlette were already fixed) --
 # bumped to the earliest version confirmed (via pip's resolver) to allow
-# pillow>=12.
-streamlit==1.51.0
+# both pillow>=12 and pyarrow>=23 together.
+streamlit==1.55.0
 # Transitive via streamlit, unpinned; resolved to a version with 15 HIGH
 # CVEs (confirmed by Trivy against the built image). Pin explicitly.
 pillow==12.3.0
+# Transitive via streamlit, unpinned; resolved to 21.0.0, a
+# use-after-free DoS CVE (confirmed by a later Trivy scan, once the
+# other four CVEs were already fixed). Pin explicitly.
+pyarrow==23.0.1
 altair==5.5.0
 plotly==5.24.1
 rich==13.8.1
-torch==2.6.0
-scapy==2.6.1
+# 2.6.0 carried 23 known CVEs per pip-audit; each subsequent fix version
+# still carried newly-disclosed ones (torch has a large native-code
+# surface and a steady CVE cadence). Bumped to the latest stable
+# release for maximum headroom.
+#
+# One disclosed advisory, PYSEC-2026-139 ("pt2 Loading Handler" /
+# deserialization, local-access-only, exploit public), currently has no
+# fix version in any release per pip-audit -- bumping cannot close it.
+# inference/models.py's own loading path already mitigates the general
+# class of risk this describes: the model file's SHA-256 is verified
+# (secrets.compare_digest) against a separately-tracked hash BEFORE
+# torch.jit.load() ever touches the bytes, so an attacker would need to
+# already control both the model file AND its tracked hash to reach this.
+torch==2.14.0
+# 2.6.1 has an unsafe-deserialization RCE (GHSA-cq46-m9x9-j8w2), fixed in 2.7.0.
+scapy==2.7.0
 
 fastapi==0.135.0
 # Transitive via fastapi, unpinned; resolved to 0.52.1, which carries an
@@ -34,9 +54,26 @@ SQLAlchemy==2.0.35
 
 redis==5.0.3
 python-json-logger==2.0.7
-idna==3.10
+# 3.10 has two known CVEs (denial-of-service on malformed input), fixed in 3.15+.
+idna==3.19
 
-faust-streaming==0.11.3
+# 0.11.3 caps click<8.2, which blocks the CVE-fixed click version below;
+# bumped to the version confirmed (via pip's resolver) to allow it.
+faust-streaming==0.15.3
 psutil==6.0.0
 python-dateutil==2.9.0.post0
-python-jose[cryptography]==3.4.0
+# Replaced python-jose: it unconditionally requires rsa+ecdsa+pyasn1
+# regardless of which extra is selected (even [cryptography], which our
+# HS256-only usage doesn't need at all), and hard-caps pyasn1<0.5.0 --
+# a version with three real DoS CVEs, with NO available fix under that
+# cap (confirmed via pip's resolver: every pyasn1 >=0.6.3 fix conflicts
+# with python-jose 3.4.0, its latest release). PyJWT is the actively-
+# maintained standard, has an equivalent encode/decode API (verified),
+# and drags in none of that legacy chain for HMAC algorithms.
+# 2.10.1 has 12 known CVEs per pip-audit (mostly PyJWKClient/algorithm-
+# allowlist issues our HS256-only, no-remote-JWKS usage doesn't reach --
+# still bumped past the fix threshold rather than relying on that).
+PyJWT==2.13.0
+# Transitive (via streamlit/faust-streaming), unpinned; resolved to
+# 8.1.8, a known CVE. Pin explicitly.
+click==8.3.3

@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
+from jwt import PyJWTError as JWTError
 from slowapi import Limiter
 from sqlalchemy.orm import Session
 

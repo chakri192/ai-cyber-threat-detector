@@ -3,7 +3,8 @@
 # developers running the test suite locally.
 -r requirements.txt
 
-pytest==8.4.2
+# 8.4.2 has a known CVE (pip-audit), fixed in 9.0.3.
+pytest==9.0.3
 pytest-cov==5.0.0
 fakeredis[lua]==2.24.1
 bandit==1.7.10
