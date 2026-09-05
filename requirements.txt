@@ -8,7 +8,7 @@ joblib==1.4.2
 # by a LATER Trivy scan, once pillow/starlette were already fixed) --
 # bumped to the earliest version confirmed (via pip's resolver) to allow
 # both pillow>=12 and pyarrow>=23 together.
-streamlit==1.55.0
+streamlit==1.63.0
 # Transitive via streamlit, unpinned; resolved to a version with 15 HIGH
 # CVEs (confirmed by Trivy against the built image). Pin explicitly.
 pillow==12.3.0
